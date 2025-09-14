@@ -3,20 +3,44 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
 )
 
-func fetch(ctx context.Context, url string) (*goquery.Document, error) {
+type pageResult struct {
+	URL   string
+	Title string
+	Err   error
+}
+
+func newHTTPClient() *http.Client {
+	tr := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: 60 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConns:        128,
+		MaxIdleConnsPerHost: 32,
+		MaxConnsPerHost:     32,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		ForceAttemptHTTP2:   true,
+	}
+	return &http.Client{Transport: tr, Timeout: 15 * time.Second}
+}
+
+func fetch(ctx context.Context, client *http.Client, url string) (*goquery.Document, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
+	req.Header.Set("User-Agent", "LemmeScrapeIt/0.1")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
@@ -33,9 +57,8 @@ func fetch(ctx context.Context, url string) (*goquery.Document, error) {
 	return doc, err
 }
 
-func extractTitle(doc *goquery.Document) (string, error) {
-	title := doc.Find("title").First().Text()
-	return title, nil
+func extractTitle(doc *goquery.Document) string {
+	return strings.TrimSpace(doc.Find("title").First().Text())
 }
 
 func extractLinks(doc *goquery.Document, baseURL string) []string {
@@ -68,25 +91,62 @@ func extractLinks(doc *goquery.Document, baseURL string) []string {
 
 func main() {
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	runCtx, runCancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer runCancel()
+	client := newHTTPClient()
+	targetURL := "https://quotes.toscrape.com/"
 
-	doc, err := fetch(ctx, "https://quotes.toscrape.com/")
+	doc, err := fetch(runCtx, client, targetURL)
 	if err != nil {
 		fmt.Println("Error fetching:", err)
 		return
 	}
 
-	title, err := extractTitle(doc)
-	if err != nil {
-		fmt.Println("Error parsing:", err)
-		return
-	}
+	title := extractTitle(doc)
 
 	fmt.Println("Title:", title)
 
-	links := extractLinks(doc, "https://quotes.toscrape.com/")
+	links := extractLinks(doc, targetURL)
 	fmt.Println("List of all the links:", links)
+	const maxConcurrent = 8
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	results := make(chan pageResult, len(links))
+	for _, u := range links {
+		u := u
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			reqCtx, reqCancel := context.WithTimeout(runCtx, 3*time.Second)
+			defer reqCancel()
+			doc, err := fetch(reqCtx, client, u)
+			if err != nil {
+				results <- pageResult{URL: u, Err: err}
+				return
+			}
+			t := extractTitle(doc)
+			results <- pageResult{URL: u, Title: t}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	ok, fail := 0, 0
+	for r := range results {
+		if r.Err != nil {
+			fail++
+			fmt.Printf("ERROR %s: %v\n", r.URL, r.Err)
+			continue
+		}
+		ok++
+		fmt.Printf("%s - %s\n", r.URL, r.Title)
+	}
+	fmt.Printf("Fetched %d OK, %d errors\n", ok, fail)
+
 	elapsed := time.Since(start)
 	fmt.Printf("Running time: %s\n", elapsed)
 }
