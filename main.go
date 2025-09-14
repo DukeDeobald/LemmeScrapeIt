@@ -1,45 +1,83 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"golang.org/x/net/context"
 )
 
-func fetch(ctx context.Context, url string) (string, error) {
+func fetch(ctx context.Context, url string) (*goquery.Document, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", fmt.Errorf("build request: %w", err)
+		return nil, fmt.Errorf("build request: %w", err)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return "", fmt.Errorf("bad status: %s", resp.Status)
+		return nil, fmt.Errorf("bad status: %s", resp.Status)
 	}
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("parse html: %w", err)
+		return nil, fmt.Errorf("parse html: %w", err)
 	}
-	return doc.Find("title").First().Text(), nil
+	return doc, err
+}
+
+func extractTitle(doc *goquery.Document) (string, error) {
+	title := doc.Find("title").First().Text()
+	return title, nil
+}
+
+func extractLinks(doc *goquery.Document, baseURL string) []string {
+	var links []string
+
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return links
+	}
+	doc.Find("a[href]").Each(func(i int, s *goquery.Selection) {
+		link, exists := s.Attr("href")
+		if !exists {
+			return
+		}
+		ref, err := url.Parse(link)
+		if err != nil {
+			return
+		}
+		normalLink := base.ResolveReference(ref).String()
+		links = append(links, normalLink)
+	})
+	return links
 }
 
 func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	title, err := fetch(ctx, "https://quotes.toscrape.com/")
+	doc, err := fetch(ctx, "https://quotes.toscrape.com/")
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Println("Error fetching:", err)
 		return
 	}
+
+	title, err := extractTitle(doc)
+	if err != nil {
+		fmt.Println("Error parsing:", err)
+		return
+	}
+
 	fmt.Println("Title:", title)
+
+	links := extractLinks(doc, "https://quotes.toscrape.com/")
+	fmt.Println("List of all the links:", links)
 }
