@@ -45,6 +45,8 @@ func extractLinks(doc *goquery.Document, baseURL string) []string {
 	if err != nil {
 		return links
 	}
+	seen := make(map[string]struct{})
+
 	doc.Find("a[href]").Each(func(i int, s *goquery.Selection) {
 		link, exists := s.Attr("href")
 		if !exists {
@@ -55,12 +57,17 @@ func extractLinks(doc *goquery.Document, baseURL string) []string {
 			return
 		}
 		normalLink := base.ResolveReference(ref).String()
+		if _, dup := seen[normalLink]; dup {
+			return
+		}
+		seen[normalLink] = struct{}{}
 		links = append(links, normalLink)
 	})
 	return links
 }
 
 func main() {
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -80,4 +87,6 @@ func main() {
 
 	links := extractLinks(doc, "https://quotes.toscrape.com/")
 	fmt.Println("List of all the links:", links)
+	elapsed := time.Since(start)
+	fmt.Printf("Running time: %s\n", elapsed)
 }
