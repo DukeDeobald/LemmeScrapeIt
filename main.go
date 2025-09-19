@@ -108,45 +108,71 @@ func main() {
 
 	links := extractLinks(doc, targetURL)
 	fmt.Println("List of all the links:", links)
-	const maxConcurrent = 8
-	sem := make(chan struct{}, maxConcurrent)
-	var wg sync.WaitGroup
-	results := make(chan pageResult, len(links))
-	for _, u := range links {
-		u := u
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
 
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			reqCtx, reqCancel := context.WithTimeout(runCtx, 3*time.Second)
-			defer reqCancel()
-			doc, err := fetch(reqCtx, client, u)
-			if err != nil {
-				results <- pageResult{URL: u, Err: err}
-				return
-			}
-			t := extractTitle(doc)
-			results <- pageResult{URL: u, Title: t}
-		}()
+	baseURL, _ := url.Parse(targetURL)
+	baseHost := strings.ToLower(baseURL.Hostname())
+
+	filtered := make([]string, 0, len(links))
+	for _, u := range links {
+		uu, err := url.Parse(u)
+		if err != nil {
+			continue
+		}
+		if uu.Scheme != "http" && uu.Scheme != "https" {
+			continue
+		}
+
+		h := strings.ToLower(uu.Hostname())
+		if h != baseHost && !strings.HasSuffix(h, "."+baseHost) {
+			continue
+		}
+
+		filtered = append(filtered, uu.String())
 	}
+
+	const workers = 8
+	jobs := make(chan string, len(filtered))
+	results := make(chan pageResult, len(filtered))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for u := range jobs {
+				reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				doc, err := fetch(reqCtx, client, u)
+				cancel()
+
+				if err != nil {
+					results <- pageResult{URL: u, Err: err}
+					continue
+				}
+				results <- pageResult{URL: u, Title: extractTitle(doc)}
+			}
+		}(i)
+	}
+
+	for _, u := range filtered {
+		jobs <- u
+	}
+	close(jobs)
+
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
+
 	ok, fail := 0, 0
 	for r := range results {
 		if r.Err != nil {
 			fail++
-			fmt.Printf("ERROR %s: %v\n", r.URL, r.Err)
 			continue
 		}
 		ok++
 		fmt.Printf("%s - %s\n", r.URL, r.Title)
 	}
 	fmt.Printf("Fetched %d OK, %d errors\n", ok, fail)
-
 	elapsed := time.Since(start)
 	fmt.Printf("Running time: %s\n", elapsed)
 }
